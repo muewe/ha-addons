@@ -1,0 +1,16 @@
+# Add-ons distributed by this repository.
+#
+# Each entry maps an add-on directory in this repository to the source
+# repository that owns its code and releases. The sync workflow
+# (.github/workflows/addon-sync.yml) copies the listed metadata files
+# whenever the version in the source repository's config.yaml changes
+# and opens a pull request containing the new changelog.
+#
+# Keys:
+#   source: "<owner>/<repository>" of the add-on source code
+#   files:  optional list of files copied from the source repository
+#           (directories are copied recursively); defaults to the
+#           standard metadata set used by published add-ons
+addons:
+  ebusd-typespec-compiler:
+    source: muewe/ha-ebusd-typespec-compiler
