@@ -1,0 +1,52 @@
+name: Add-on sync
+
+# Keeps the add-on directories in this repository in sync with their source
+# repositories (see addons.yaml). A release in a source repository is a
+# version bump in its config.yaml on the default branch; whenever the sync
+# bot detects a new version, it copies the metadata files and opens a pull
+# request containing the new changelog.
+#
+# The scheduled run polls all source repositories. Source repositories can
+# also trigger an immediate sync with a repository_dispatch event of type
+# "addon-release" (requires a personal access token, see README).
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      addon:
+        description: "Sync only this add-on (empty for all)"
+        required: false
+        type: string
+      force:
+        description: "Sync even if the version is unchanged"
+        required: false
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [addon-release]
+
+permissions: {}
+
+concurrency:
+  group: addon-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync add-ons
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Sync add-ons from their source repositories
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ONLY_ADDON: ${{ github.event.client_payload.addon || inputs.addon }}
+          FORCE: ${{ inputs.force }}
+        run: .github/scripts/sync-addons.sh "$ONLY_ADDON"
