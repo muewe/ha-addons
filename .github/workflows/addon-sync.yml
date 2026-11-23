@@ -43,10 +43,13 @@ jobs:
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
 
       - name: Sync add-ons from their source repositories
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
           ONLY_ADDON: ${{ github.event.client_payload.addon || inputs.addon }}
           FORCE: ${{ inputs.force }}
         run: .github/scripts/sync-addons.sh "$ONLY_ADDON"
