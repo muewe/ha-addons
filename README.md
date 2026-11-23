@@ -53,6 +53,17 @@ bot detects a new version, it copies the metadata files and opens a pull
 request containing the new changelog. The add-on directories are fully
 managed by the bot — manual edits are overwritten by the next sync.
 
+### Sync workflow permissions
+
+In **Settings → Actions → General → Workflow permissions**, enable
+**Allow GitHub Actions to create and approve pull requests** and save.
+The workflow uses the built-in `GITHUB_TOKEN` to push a sync branch and open
+or update its pull request; it does not approve or merge pull requests.
+Leave the default workflow token permission on **Read repository contents and
+packages**: the sync job explicitly requests the write permissions it needs.
+If the run reports a pull request permission error, check this setting before
+rerunning the workflow.
+
 ### Adding a new add-on
 
 1. Publish the add-on's image to `ghcr.io/<owner>/<image>` from its source
@@ -84,4 +95,3 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.ADDON_SYNC_TOKEN }}
 ```
-

@@ -13,6 +13,7 @@
 #
 # Environment:
 #   GH_TOKEN     GitHub token for pull requests (optional in dry runs)
+#   BASE_BRANCH  destination default branch (auto-detected if omitted)
 #   DRY_RUN=1    apply the file changes, but skip branch, push and PR
 #   FORCE=1      sync even when the versions already match
 set -euo pipefail
@@ -49,29 +50,65 @@ PY
 )
 [ -n "$entries" ] || { echo "::error::No add-ons defined in addons.yaml" >&2; exit 1; }
 
-sync_addon() {
+read_version() {
+    python3 - "$1" <<'PY'
+import sys
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as file:
+    # Keep the exact version string, whether quoted or unquoted.
+    config = yaml.load(file, Loader=yaml.BaseLoader) or {}
+version = config.get("version")
+if not isinstance(version, str) or not version.strip():
+    sys.exit(f"No valid version found in {sys.argv[1]}")
+print(version)
+PY
+}
+
+if [ "$DRY_RUN" = 0 ]; then
+    if [ -z "${BASE_BRANCH:-}" ]; then
+        if base_ref=$(git symbolic-ref --quiet refs/remotes/origin/HEAD); then
+            BASE_BRANCH=${base_ref#refs/remotes/origin/}
+        else
+            remote_head=$(git ls-remote --symref origin HEAD)
+            BASE_BRANCH=$(sed -n $'s|^ref: refs/heads/\\(.*\\)\tHEAD$|\\1|p' <<< "$remote_head")
+        fi
+    fi
+    base_ref="refs/remotes/origin/${BASE_BRANCH:-}"
+    if ! git show-ref --verify --quiet "$base_ref"; then
+        echo "::error::Destination default branch is not available locally: $base_ref" >&2
+        exit 1
+    fi
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "::error::Start the sync with a clean working tree." >&2
+        exit 1
+    fi
+    git checkout -q --detach "$base_ref"
+fi
+
+# Invoke this subshell directly, not as a condition: Bash disables errexit
+# inside functions called from an if test or the left side of an OR-list.
+sync_addon() (
     local addon=$1 source=$2 files_csv=$3
-    local files=(${files_csv//,/ })
+    local -a files
+    IFS=, read -r -a files <<< "$files_csv"
     local checkout commit_sha new_version old_version
 
     echo "::group::$addon"
     checkout=$(mktemp -d)
+    trap 'rm -rf "$checkout"; echo "::endgroup::"' EXIT
     git clone -q --depth 1 "https://github.com/$source.git" "$checkout/source"
 
     # The version in the source repository's config.yaml is the single
     # source of truth for releases (see the repository README).
-    new_version=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' "$checkout/source/config.yaml")
-    old_version=$(sed -n 's/^version:[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' "$addon/config.yaml" 2> /dev/null || true)
-    if [ -z "$new_version" ]; then
-        echo "::error::$addon: no version found in $source/config.yaml"
-        rm -rf "$checkout"
-        return 1
+    new_version=$(read_version "$checkout/source/config.yaml")
+    old_version=
+    if [ -f "$addon/config.yaml" ]; then
+        old_version=$(read_version "$addon/config.yaml")
     fi
 
     if [ "$new_version" = "$old_version" ] && [ "$FORCE" = 0 ]; then
         echo "$addon is up to date at version $old_version."
-        rm -rf "$checkout"
-        echo "::endgroup::"
         return 0
     fi
     echo "$addon: $old_version -> $new_version (source: $source)"
@@ -88,14 +125,12 @@ sync_addon() {
             cp -a "$checkout/source/$file" "$addon/$file"
         elif [ "$file" = config.yaml ]; then
             echo "::error::$addon: config.yaml is missing in $source"
-            rm -rf "$checkout"
             return 1
         else
             echo "Warning: $source does not contain $file, skipping it."
         fi
     done
     commit_sha=$(git -C "$checkout/source" rev-parse HEAD)
-    rm -rf "$checkout"
 
     # Changelog section of the new version, for the pull request body.
     local changelog
@@ -103,10 +138,16 @@ sync_addon() {
 """Print the changelog section of the given version."""
 import re
 import sys
+from pathlib import Path
 
-text = open(sys.argv[1], encoding="utf-8").read()
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8") if path.is_file() else ""
 version = re.escape(sys.argv[2])
-match = re.search(rf"(?ms)^## {version}[^\n]*\n(.*?)(?=^## |\Z)", text)
+match = re.search(
+    rf"(?ms)^##[ \t]+(?:\[v?{version}\]|v?{version})(?=[ \t]|\r?$)[^\n]*\n"
+    r"(.*?)(?=^##[ \t]|\Z)",
+    text,
+)
 print(match.group(1).strip() if match
       else "No changelog entry found for this version.")
 PY
@@ -114,34 +155,24 @@ PY
 
     if [ "$DRY_RUN" = 1 ]; then
         echo "Dry run: would commit and open a pull request for $addon $new_version."
-        echo "::endgroup::"
         return 0
     fi
 
-    # One branch per add-on, always recreated from the default branch.
-    # An open pull request on the branch is updated by the force push.
+    # Commit from the destination default branch and push to a dedicated
+    # bot branch. No local branch or origin/HEAD is required.
     local branch="sync/$addon"
-    local base
-    base=$(git rev-parse --abbrev-ref origin/HEAD 2> /dev/null || true)
-    base=${base#origin/}
-    [ -n "$base" ] || base=main
-    git checkout -q -B "$branch" "origin/$base"
-
-    git config user.name "github-actions[bot]"
-    git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
     git add -A "$addon"
     if git diff --cached --quiet; then
         echo "No file changes for $addon, skipping."
-        git checkout -q --detach "origin/$base"
-        echo "::endgroup::"
         return 0
     fi
-    git commit -qm "Sync $addon from $source at version $new_version"
+    git -c user.name="github-actions[bot]" \
+        -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+        commit -qm "Sync $addon from $source at version $new_version"
 
     # Built with printf so changelog content is never interpreted by the
     # shell (it may contain markdown such as backticks).
-    local body
-    body=$(mktemp)
+    local body="$checkout/pr-body.md"
     {
         printf 'Syncs `%s` from [%s](https://github.com/%s) at version **%s**.\n\n' \
             "$addon" "$source" "$source" "$new_version"
@@ -149,21 +180,31 @@ PY
         printf '## Changelog\n\n%s\n' "$changelog"
     } > "$body"
 
-    git push -q --force origin "$branch"
-    if [ -z "$(gh pr list --head "$branch" --state open --json number --jq '.[].number' 2> /dev/null)" ]; then
-        gh pr create --title "Sync $addon to $new_version" --body-file "$body" --head "$branch"
+    local pr_number
+    pr_number=$(gh pr list --base "$BASE_BRANCH" --head "$branch" --state open \
+        --json number --jq '.[].number')
+    git push -q --force origin "HEAD:refs/heads/$branch"
+    if [ -z "$pr_number" ]; then
+        if ! gh pr create --base "$BASE_BRANCH" --head "$branch" \
+            --title "Sync $addon to $new_version" --body-file "$body"; then
+            echo "::error::Could not create the pull request. Check the GitHub error above and the Actions settings in README.md." >&2
+            return 1
+        fi
         echo "Opened a pull request for $addon $new_version."
     else
-        echo "Updated the existing pull request for $addon (branch $branch)."
+        gh pr edit "$pr_number" --title "Sync $addon to $new_version" --body-file "$body"
+        echo "Updated pull request #$pr_number for $addon $new_version."
     fi
-    rm -f "$body"
-    git checkout -q --detach "origin/$base"
-    echo "::endgroup::"
-}
+    git checkout -q --detach "$base_ref"
+)
 
-status=0
+matched=0
 while IFS=$'\t' read -r addon source files; do
     [ -n "$ONLY_ADDON" ] && [ "$addon" != "$ONLY_ADDON" ] && continue
-    sync_addon "$addon" "$source" "$files" || status=1
+    matched=1
+    sync_addon "$addon" "$source" "$files"
 done <<< "$entries"
-exit $status
+if [ "$matched" = 0 ]; then
+    echo "::error::Unknown add-on: $ONLY_ADDON" >&2
+    exit 1
+fi
